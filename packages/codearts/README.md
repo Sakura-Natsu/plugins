@@ -76,7 +76,7 @@ signing in, a short built-in catalog stands in.
 
 | Option | Default | What it does |
 |---|---|---|
-| `maxInflight` | `3` | chats in flight per account |
+| `maxInflight` | `3` | chats in flight per account; it can only lower the vendor's cap of 3 sessions |
 | `retryBudgetMs` | `150000` | how long to retry `TM.00001041` before answering `429` |
 | `retryDelays` | `[2000,4000,6000,8000,10000]` | retry waits in ms (the last repeats) |
 | `queueBudgetMs` | `300000` | how long to wait in the gateway's queue |
