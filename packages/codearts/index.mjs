@@ -823,7 +823,8 @@ function parseSseEvents(text) {
 
 /** The error code an answer carries (`TM.00001041`, `InferHub.4291.200`, …), or "". */
 function errorCodeOf(text) {
-  const m = /"(?:error_code|code)"\s*:\s*"([A-Za-z]*\.?[0-9][0-9A-Za-z.]*)"/.exec(String(text ?? ""))
+  // Any number of named parts before the digits: `InferHub.ModelArts.81111.429`.
+  const m = /"(?:error_code|code)"\s*:\s*"((?:[A-Za-z]+\.)*[A-Za-z]*[0-9][0-9A-Za-z.]*)"/.exec(String(text ?? ""))
   return m ? m[1] : ""
 }
 
@@ -882,7 +883,9 @@ function classifyHead(text, done) {
   const code = errorCodeOf(text)
   // Wait for the error event's end, so its message is whole.
   if (code) return done || /\n/.test(text.slice(text.indexOf(code))) ? code : undefined
-  if (done || text.includes("[DONE]")) return "answer"
+  // The stream's own end, never a "[DONE]" inside an event: the gateway's
+  // rate-limit error carries `"text":"[DONE]"`.
+  if (done || /^data:\s*\[DONE\]\s*$/m.test(text)) return "answer"
   return undefined
 }
 

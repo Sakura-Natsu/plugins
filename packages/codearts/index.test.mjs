@@ -211,6 +211,9 @@ test("prepareChatBody reshapes a chat into what the gateway accepts and meters",
   assert.equal(x.prepareChatBody(null), null)
 })
 
+// The free model's TPM limit, word for word as the gateway sent it in a 200.
+const tpmEvent = 'data:{"text":"[DONE]","error_code":"InferHub.ModelArts.81111.429","error_msg":"The model TPM limit has been significantly exceeded. Please reduce the request rate and retry later."}'
+
 test("classifyHead tells an answer from an embedded error", () => {
   const role = `data: ${JSON.stringify({ choices: [{ delta: { role: "assistant" } }] })}\n\n`
   const content = `data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\n`
@@ -221,12 +224,22 @@ test("classifyHead tells an answer from an embedded error", () => {
   assert.equal(x.classifyHead(`data: {"error_code":"TM.00001041"`, false), undefined) // not whole yet
   assert.equal(x.classifyHead("", true), "answer")
   assert.equal(x.classifyHead(JSON.stringify({ choices: [{ message: { content: "x" } }] }), true), "answer")
+  // The free model's TPM limit, as the gateway sends it: no space after
+  // `data:`, a code of several parts, and a "[DONE]" that is no end.
+  assert.equal(x.classifyHead(`${tpmEvent}\n\n`, false), "InferHub.ModelArts.81111.429")
+  assert.equal(x.classifyHead(`data: ${JSON.stringify({ text: "[DONE]" })}\n\n`, false), undefined)
+  assert.equal(x.classifyHead(role + "data: [DONE]\n\n", false), "answer")
 })
 
 test("errorCodeOf / errorMessageOf / isRateLimitCode read the gateway's errors", () => {
   const text = '{"error_code":"InferHub.4291.200","error_msg":"insufficient \\"quota\\""}'
   assert.equal(x.errorCodeOf(text), "InferHub.4291.200")
   assert.equal(x.errorMessageOf(text), 'insufficient "quota"')
+  for (const code of ["InferHub.ModelArts.81111.429", "TM.00001041", "APIG.0602", "81114.429", "STS5.1806"]) {
+    assert.equal(x.errorCodeOf(`{"error_code":"${code}"}`), code)
+  }
+  assert.equal(x.errorCodeOf('{"code":"build"}'), "", "a word is no code")
+  assert.equal(x.isRateLimitCode("InferHub.ModelArts.81111.429"), true)
   assert.equal(x.isRateLimitCode("InferHub.4291.200"), true)
   assert.equal(x.isRateLimitCode("81111.429"), true)
   assert.equal(x.isRateLimitCode("InferHub.002002009.404"), false)
@@ -774,6 +787,19 @@ test("an error inside a 200 becomes a status magpie acts on, with the vendor's w
   const body = await b.json()
   assert.equal(body.error.code, "InferHub.002002009.404")
   assert.equal(body.error.message.startsWith("CodeArts"), false, "magpie adds the provider name itself")
+})
+
+test("the free model's TPM limit inside a 200 is a 429 magpie fails over on, not an empty reply", async () => {
+  const cred = await makeCred()
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: async () => sseResponse(`${tpmEvent}\n\n`) })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  for (const stream of [true, false]) {
+    const res = await loaded.fetch(CHAT_URL, chatInit({ model: "deepseek-v4.1-flash", messages: [{ role: "user", content: "你好" }], stream }))
+    assert.equal(res.status, 429)
+    const body = await res.json()
+    assert.equal(body.error.code, "InferHub.ModelArts.81111.429")
+    assert.match(body.error.message, /TPM limit/)
+  }
 })
 
 test("embeddedErrorStatus sorts the gateway's codes into what magpie acts on", () => {
