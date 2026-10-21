@@ -1734,13 +1734,23 @@ test("checkin confirms a claim left unconfirmed, and tries again later when the 
   assert.deepEqual(calls.map((c) => [c.method, c.url]), [["GET", x.OPS_DELIVERY_URL], ["POST", x.OPS_CONFIRM_URL]])
   assert.deepEqual(calls[1].body, { campaignId: 1 })
   assert.equal((await x.dailyCheckin(cred, fetcher)).outcome, "done")
-  // A claim with nothing to confirm: the vendor refuses the confirm, and it is done.
-  const nothing = () => new Response(JSON.stringify({ code: 1002, message: "nothing to confirm" }), { status: 200 })
-  const claimedOnly = opsFetcher({ item: daily({ claimable: false, status: "CLAIMED" }) }, { confirm: nothing })
-  assert.equal((await x.dailyCheckin(cred, claimedOnly.fetcher)).outcome, "done")
-  // And one that fails for now is tried again later.
-  const flaky = opsFetcher({ item: daily({ claimable: false, status: "CLAIMED" }) }, { confirm: () => new Response("", { status: 503 }) })
-  assert.equal((await x.dailyCheckin(cred, flaky.fetcher)).outcome, "failed")
+  // A confirm the vendor turns down while the activity is still only claimed
+  // (活动太火爆, a code in a 200, as much as a 503): a failure, tried again later.
+  const busy = () => new Response(JSON.stringify({ code: 500, message: "活动太火爆" }), { status: 200 })
+  for (const confirm of [busy, () => new Response("", { status: 503 })]) {
+    const still = opsFetcher({ item: daily({ claimable: false, status: "CLAIMED" }) }, { confirm })
+    const r = await x.dailyCheckin(cred, still.fetcher)
+    assert.equal(r.outcome, "failed")
+    assert.match(r.message, /^领取确认失败：/)
+    assert.deepEqual(still.calls.map((c) => c.method), ["GET", "POST", "GET"], "the activity is looked at again")
+  }
+  // Turned down because it was confirmed meanwhile (the IDE): done.
+  const elsewhere = (st) => {
+    st.item = { ...st.item, status: "CONFIRMED" }
+    return new Response(JSON.stringify({ code: 1002, message: "already confirmed" }), { status: 200 })
+  }
+  const meanwhile = opsFetcher({ item: daily({ claimable: false, status: "CLAIMED" }) }, { confirm: elsewhere })
+  assert.equal((await x.dailyCheckin(cred, meanwhile.fetcher)).outcome, "done")
 })
 
 test("checkin tells done, inactive and ineligible apart", async () => {

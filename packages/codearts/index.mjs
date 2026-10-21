@@ -1424,9 +1424,7 @@ function describeHttpFailure(status, text) {
 /**
  * A signed snap-access call the way the IDE's ActivityWelfarePane makes it:
  * `{ code, message, data }` back, `code !== 0` being a refusal.
- * Gives `{ ok: true, data }` or `{ ok: false, message }` (`refused: true` when
- * the vendor answered with a refusal, not a network or HTTP failure), never
- * throws.
+ * Gives `{ ok: true, data }` or `{ ok: false, message }`, never throws.
  */
 async function snapRequest(method, url, cred, fetcher, payload) {
   const body = payload === undefined ? new Uint8Array() : utf8(JSON.stringify(payload))
@@ -1456,7 +1454,7 @@ async function snapRequest(method, url, cred, fetcher, payload) {
   const raw = safeJson(text)
   if (!raw || Array.isArray(raw)) return { ok: false, message: "the answer could not be read" }
   if (raw.code !== undefined && Number(raw.code) !== 0) {
-    return { ok: false, refused: true, message: firstOf(raw.message, raw.msg, `code ${raw.code}`) }
+    return { ok: false, message: firstOf(raw.message, raw.msg, `code ${raw.code}`) }
   }
   return { ok: true, data: "data" in raw ? raw.data : raw }
 }
@@ -1610,13 +1608,15 @@ async function dailyCheckin(cred, fetcher) {
   if (!item) return { outcome: "inactive", message: "当前没有每日领取活动" }
   const credit = num(item.benefitAmount)
   // Claimed but never confirmed (a confirm that failed): confirm it now, or
-  // the credits stay pending. A refusal means there is nothing to confirm;
-  // a failure is tried again later that day.
+  // the credits stay pending. When the confirm fails, only the activity
+  // itself tells whether it was confirmed after all; still claimed, it is a
+  // failure magpie tries again later that day.
   const campaign = item.campaignId !== undefined && item.campaignId !== null && item.campaignId !== ""
   if (!item.claimable && item.status === "CLAIMED" && campaign) {
     const confirmed = await snapRequest("POST", OPS_CONFIRM_URL, cred, fetcher, { campaignId: item.campaignId })
     if (confirmed.ok) return claimedOutcome({}, credit)
-    if (confirmed.refused) return { outcome: "done", message: "今天已领取" }
+    const again = await dailyCampaign(cred, fetcher)
+    if (isClaimedToday(again.item) && again.item.status !== "CLAIMED") return { outcome: "done", message: "今天已领取" }
     return { outcome: "failed", message: `领取确认失败：${confirmed.message}` }
   }
   if (isClaimedToday(item)) return { outcome: "done", message: "今天已领取" }
