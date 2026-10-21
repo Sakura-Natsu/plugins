@@ -31,14 +31,18 @@ STS answers with temporary AK/SK/security-token credentials and a refresh token.
 PKCE verifier and the DPoP private key) is a JSON string in the account's `access` field, in
 magpie's (or OpenCode's) own account store. `auth.refresh` renews it 30 minutes before it
 expires, reusing the same verifier and DPoP key; a stale credential met on a request
-(`401`, `APIG.0602`) is renewed once and the request sent again. The account id is the signer
-named in the refresh token, so signing in again replaces the account instead of adding one.
+(`401`, `APIG.0602`) is renewed once and the request sent again. A refresh token is spent once
+per account, however many loaders ask; a renewal that only fails for now (STS unreachable)
+answers `503` and keeps the sign-in, and only one STS turns away for good marks it. The
+account id is the signer named in the refresh token, so signing in again replaces the account
+instead of adding one.
 
 ## Models
 
 The account's live list: CodeArts' builtin models, plus the free models of its daily benefit
 once today's benefit has been claimed (`POST /api/v1/benefit/claim`, once a Beijing day, as the
-client does). Each model's credit rate (the client's 「消耗系数」) is reported as magpie's `rate`,
+client does; a `benefit not found` on a day not yet claimed claims it too). Each model's credit
+rate (the client's 「消耗系数」) is reported as magpie's `rate`,
 with its reasoning flag and limits, from the account's main agent (`build`) model list. Before
 signing in, a short built-in catalog stands in.
 
@@ -69,7 +73,8 @@ signing in, a short built-in catalog stands in.
   `~/.config/magpie/codearts-checkins.json` (or `MAGPIE_CODEARTS_LEDGER`). This part is still
   being checked against more accounts — trust the CodeArts console where they differ.
 - `auth.checkin`: the client's 「限时福利 → 每日领取」 — `GET /v1/ops/delivery?channel=IDE`,
-  `POST /v1/ops/claim`, then `POST /v1/ops/confirm` when the claim answers an id. Turn on
+  `POST /v1/ops/claim`, then `POST /v1/ops/confirm` when the claim answers an id (a claim left
+  unconfirmed is confirmed at the next check-in). Turn on
   *Auto check-in* for CodeArts under **Settings → Usage → Plugins**.
 
 ## Options
@@ -102,17 +107,18 @@ magpie 里使用其 GLM、DeepSeek、openPangu 等模型。provider id：`codear
 - **登录**：华为云 OAuth（PKCE + DPoP），本机 `127.0.0.1`（端口 ≥ 10000）接收回调，向 STS 换取临时
   AK/SK/security-token。完整凭据（含 refresh_token、PKCE verifier、DPoP 私钥）以 JSON 存在账号的
   `access` 字段里，保存在 magpie / OpenCode 自己的账号存储中；过期前 30 分钟自动续期，请求遇到临时凭据
-  过期时就地续期并重发一次；账号标识取自 refresh_token，重复登录不会多出账号。
+  过期时就地续期并重发一次。同一账号的 refresh_token 只用一次；续期只是暂时失败（如 STS 连不上）时返回
+  `503` 并保留登录，只有被 STS 明确拒绝才标记需要重新登录。账号标识取自 refresh_token，重复登录不会多出账号。
 - **模型**：账号实时的内置模型列表；领取当日免费权益成功后，再加上免费模型（每个北京自然日领一次，与
-  客户端一致）。每个模型的「消耗系数」作为 magpie 的倍率上报，来自账号主智能体（`build`）的模型列表。
+  客户端一致；当天还没领取时遇到 `benefit not found` 也会先领取再重发）。每个模型的「消耗系数」作为 magpie 的倍率上报，来自账号主智能体（`build`）的模型列表。
 - **请求**：SDK-HMAC-SHA256 签名；像客户端一样发送 `x-ot-session-id` 会话头（每账号一个会话），账号内
   在途请求不超过 3 个，`TM.00001041` 退避重试，网关排队时按客户端的方式等待；总是以流式请求上游（码道
   只对流式回答计量积分），调用方要非流式时折叠回 JSON；默认注入 `thinking: { type: "enabled" }`，思考与
   正文分开；200 里内嵌的错误换算为 `429` / `400` / `502` 并带厂商原话。
 - **用量与签到**：总积分决定账号是否可用，其余积分桶只做明细；另有每日免费额度窗口。各批积分的到期
   时间读自码道控制台同一批接口，读不到时退回插件的签到账本 `~/.config/magpie/codearts-checkins.json`
-  （这部分仍在用更多账号验证，请以控制台为准）。`auth.checkin` 与客户端「限时福利 → 每日领取」一致，
-  在 **设置 → 用量 → Plugins** 打开「每日自动签到」即可。
+  （这部分仍在用更多账号验证，请以控制台为准）。`auth.checkin` 与客户端「限时福利 → 每日领取」一致
+  （领取后未确认的，下次签到时补确认），在 **设置 → 用量 → Plugins** 打开「每日自动签到」即可。
 - **致谢**：原作者 [yuweihao17](https://github.com/yuweihao17/codearts)；HuHong-Tao、ReachForStar 的
   实测与实现；[Ebony-Vinyl/dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)。
 

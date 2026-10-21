@@ -950,6 +950,43 @@ test("giving up in the queue takes the request out of it", async () => {
   assert.deepEqual(calls.map((c) => c[0]), ["POST", "DELETE"])
 })
 
+test("a queue poll that hangs can't outlast the wait: the request leaves the queue, a 429", async () => {
+  const cred = await makeCred()
+  const calls = []
+  let deleted
+  const sawDelete = new Promise((r) => { deleted = r })
+  const fetcher = async (url, init) => {
+    calls.push(init.method)
+    if (init.method === "DELETE") {
+      deleted()
+      return new Response("{}", { status: 200 })
+    }
+    if (String(url) === x.TRACE_QUEUE_URL("T3")) {
+      // The poll never answers: only its signal ends it (without one, never),
+      // at once when it ended while the request was signed, as fetch does.
+      // Its open socket is what keeps a real process alive meanwhile: an
+      // AbortSignal.timeout alone doesn't, in node or bun.
+      return new Promise((_, reject) => {
+        if (init.signal?.aborted) return reject(init.signal.reason)
+        const socket = setInterval(() => {}, 1_000)
+        init.signal?.addEventListener("abort", () => {
+          clearInterval(socket)
+          reject(init.signal.reason)
+        })
+      })
+    }
+    return new Response("{}", { status: 429, headers: { "queue-status": "queued", "trace-id": "T3", "retry-after": "0" } })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueBudgetMs: 200 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))
+  assert.equal(res.status, 429)
+  await sawDelete
+  assert.equal(calls[0], "POST")
+  assert.equal(calls.at(-1), "DELETE")
+  assert.ok(calls.slice(1, -1).length >= 1 && calls.slice(1, -1).every((m) => m === "GET"))
+})
+
 test("a 429 that is no queue passes through for magpie to fail over", async () => {
   const cred = await makeCred()
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: async () => new Response('{"error_code":"81111.429"}', { status: 429 }) })
@@ -1108,6 +1145,109 @@ test("a request to any other host is refused before the credentials leave", asyn
     assert.match((await res.json()).error.message, /refusing to sign a request to/)
   }
   assert.equal(calls, 0)
+})
+
+const staleBody = '{"error_code":"APIG.0602","error_msg":"the security token has expired"}'
+const spentBody = JSON.stringify({ error_code: "STS5.1806", error_msg: "refresh token has been used" })
+
+test("a renewal that fails only for now keeps the sign-in, and the next request renews again", async () => {
+  const cred = await makeCred()
+  let sts = 0
+  const fetcher = async (url, init) => {
+    if (String(url) === x.STS_TOKEN_ENDPOINT) {
+      sts += 1
+      return sts === 1 ? new Response("upstream unavailable", { status: 503 }) : new Response(stsBody("AK2", "R2"), { status: 200 })
+    }
+    return /Access=AK,/.test(new Headers(init.headers).get("authorization")) ? new Response(staleBody, { status: 401 }) : sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const a = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))
+  assert.equal(a.status, 503)
+  assert.equal(a.headers.get("x-magpie-sign-in"), "kept")
+  const b = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [], stream: true }))
+  assert.equal(b.status, 200)
+  await b.text()
+  assert.equal(sts, 2)
+
+  // A request that isn't a chat: the same.
+  const other = await CodeArtsAuthPlugin({ client: {} }, {
+    fetch: async (url) => (String(url) === x.STS_TOKEN_ENDPOINT ? new Response("", { status: 503 }) : new Response(staleBody, { status: 401 })),
+  })
+  const res = await (await other.auth.loader(async () => makeAuth(cred))).fetch("https://snap-access.cn-north-4.myhuaweicloud.com/v1/model/builtin", { method: "GET" })
+  assert.equal(res.status, 503)
+  assert.equal(res.headers.get("x-magpie-sign-in"), "kept")
+})
+
+test("two loaders of one account and magpie's own renewal spend its refresh token once", async () => {
+  const cred = await makeCred()
+  let sts = 0
+  let release
+  const held = new Promise((r) => { release = r })
+  const fetcher = async (url, init) => {
+    if (String(url) === x.STS_TOKEN_ENDPOINT) {
+      sts += 1
+      await held
+      // STS takes a refresh token once.
+      return sts === 1 ? new Response(stsBody("AK2", "R2"), { status: 200 }) : new Response(spentBody, { status: 400 })
+    }
+    return /Access=AK,/.test(new Headers(init.headers).get("authorization")) ? new Response(staleBody, { status: 401 }) : sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  // Nothing is stored meanwhile: every read gives the old record.
+  const getAuth = async () => makeAuth(cred)
+  const loaders = await Promise.all([plugin.auth.loader(getAuth), plugin.auth.loader(getAuth)])
+  const answers = Promise.all(loaders.map((l) => l.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))))
+  const refreshed = plugin.auth.refresh(makeAuth(cred))
+  while (sts < 1) await new Promise((r) => setTimeout(r, 5))
+  await new Promise((r) => setTimeout(r, 20))
+  release()
+  for (const res of await answers) {
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get("x-magpie-sign-in"), null)
+  }
+  assert.equal(JSON.parse((await refreshed).access).access_key_id, "AK2")
+  // One that comes later with the spent token gets what the renewal gave.
+  assert.equal(JSON.parse((await plugin.auth.refresh(makeAuth(cred))).access).access_key_id, "AK2")
+  assert.equal(sts, 1)
+})
+
+test("a refresh token spent a moment ago by someone else: their renewal is taken, the sign-in kept", async () => {
+  const cred = await makeCred()
+  const theirs = { ...cred, access_key_id: "AK3", secret_access_key: "SK3", security_token: "ST3", refresh_token: "R3" }
+  let stored = cred
+  const fetcher = async (url, init) => {
+    if (String(url) === x.STS_TOKEN_ENDPOINT) {
+      stored = theirs // another process won the race and saved its renewal
+      return new Response(spentBody, { status: 400 })
+    }
+    return /Access=AK,/.test(new Headers(init.headers).get("authorization")) ? new Response(staleBody, { status: 401 }) : sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(stored))
+  const res = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [], stream: true }))
+  assert.equal(res.status, 200)
+  assert.equal(await res.text(), okStream)
+  const next = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [], stream: true }))
+  assert.equal(next.status, 200, "the account isn't marked")
+  await next.text()
+})
+
+test("a reshaped body goes without the caller's Content-Length", async () => {
+  const cred = await makeCred()
+  const seen = []
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {
+    fetch: async (url, init) => {
+      seen.push({ length: new Headers(init.headers).get("content-length"), bytes: init.body.length })
+      return sseResponse(okStream)
+    },
+  })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const body = JSON.stringify({ model: "codearts/GLM-5.2", messages: [] })
+  const headers = { "content-type": "application/json", "content-length": String(body.length) }
+  await (await loaded.fetch(CHAT_URL, { method: "POST", headers, body })).text()
+  assert.equal(seen[0].length, null)
+  assert.notEqual(seen[0].bytes, body.length, "the body was reshaped")
 })
 
 test("requestToken reads a spent refresh token as a sign-in gone for good", async () => {
@@ -1381,6 +1521,44 @@ test("a benefit the account can't claim: no free models, and no benefit header",
   assert.deepEqual(sent, [null])
 })
 
+test("benefit not found on a day not yet claimed claims it, and sends the free model again", async () => {
+  const state = {
+    benefit: new Set(["deepseek-v4.1-flash"]), regular: new Set(["deepseek-v4.1-flash"]), noBenefit: new Set(),
+    claim: { day: "2000-01-01", ok: true, at: 0 }, claiming: null,
+  }
+  const sent = []
+  let claims = 0
+  const fetcher = async (url, init) => {
+    if (String(url) === x.BENEFIT_CLAIM_URL) {
+      claims += 1
+      return new Response('{"error_code":"0000"}', { status: 200 })
+    }
+    const benefit = new Headers(init.headers).get("maas_type")
+    sent.push(benefit)
+    // Yesterday's benefit is spent: only today's claim brings it back.
+    return benefit && !claims ? sseResponse(sse({ error_code: "InferHub.4004.200", error_msg: "benefit not found" })) : sseResponse(okStream)
+  }
+  const context = { ...(await x.accountSessionIds(signedCred)), gate: x.createConcurrencyGate(3), state, fetcher }
+  const res = await x.signedFetch(signedCred, CHAT_URL, chatInit({ model: "deepseek-v4.1-flash", messages: [] }), context)
+  assert.equal(res.status, 200)
+  assert.equal((await res.json()).choices[0].message.content, "你好")
+  assert.deepEqual(sent, ["benefit", "benefit"])
+  assert.equal(claims, 1)
+  assert.equal(state.claim.day, x.beijingDay())
+  assert.equal(state.noBenefit.size, 0)
+})
+
+test("a day's claim asks again about the models the last day had no benefit for", async () => {
+  const state = { noBenefit: new Set(["deepseek-v4.1-flash"]), claim: { day: "2000-01-01", ok: true, at: 0 } }
+  const claimed = async () => new Response('{"error_code":"0000"}', { status: 200 })
+  assert.equal(await x.ensureBenefitClaimed(signedCred, claimed, state), true)
+  assert.equal(state.noBenefit.size, 0)
+  // A refused claim leaves them as they were.
+  const refused = { noBenefit: new Set(["deepseek-v4.1-flash"]), claim: null }
+  assert.equal(await x.ensureBenefitClaimed(signedCred, async () => new Response('{"error_code":"4004"}', { status: 200 }), refused), false)
+  assert.equal(refused.noBenefit.size, 1)
+})
+
 test("ensureBenefitClaimed claims once a day and asks again only an hour after a refusal", async () => {
   const cred = await makeCred()
   let claims = 0
@@ -1541,9 +1719,33 @@ test("checkin skips the confirm when the claim answers no id", async () => {
   assert.equal(calls.some((c) => c.url === x.OPS_CONFIRM_URL), false)
 })
 
+test("checkin confirms a claim left unconfirmed, and tries again later when the confirm fails", async () => {
+  const cred = await makeCred()
+  // The first try: the claim goes through, the confirm doesn't.
+  const s = { item: daily() }
+  const first = await x.dailyCheckin(cred, opsFetcher(s, { confirm: () => new Response("", { status: 502 }) }).fetcher)
+  assert.deepEqual(first, { outcome: "failed", message: "领取确认失败：HTTP 502" })
+  assert.equal(s.item.status, "CLAIMED")
+  // Later that day: it is confirmed now, not taken as done.
+  const { fetcher, calls } = opsFetcher(s)
+  const { grant, ...again } = await x.dailyCheckin(cred, fetcher)
+  assert.deepEqual(again, { outcome: "claimed", credit: 1000, message: "+1000 积分" })
+  assert.equal(grant.credit, 1000)
+  assert.deepEqual(calls.map((c) => [c.method, c.url]), [["GET", x.OPS_DELIVERY_URL], ["POST", x.OPS_CONFIRM_URL]])
+  assert.deepEqual(calls[1].body, { campaignId: 1 })
+  assert.equal((await x.dailyCheckin(cred, fetcher)).outcome, "done")
+  // A claim with nothing to confirm: the vendor refuses the confirm, and it is done.
+  const nothing = () => new Response(JSON.stringify({ code: 1002, message: "nothing to confirm" }), { status: 200 })
+  const claimedOnly = opsFetcher({ item: daily({ claimable: false, status: "CLAIMED" }) }, { confirm: nothing })
+  assert.equal((await x.dailyCheckin(cred, claimedOnly.fetcher)).outcome, "done")
+  // And one that fails for now is tried again later.
+  const flaky = opsFetcher({ item: daily({ claimable: false, status: "CLAIMED" }) }, { confirm: () => new Response("", { status: 503 }) })
+  assert.equal((await x.dailyCheckin(cred, flaky.fetcher)).outcome, "failed")
+})
+
 test("checkin tells done, inactive and ineligible apart", async () => {
   const cred = await makeCred()
-  for (const status of ["CLAIMED", "CONFIRMED", "CONSUMED"]) {
+  for (const status of ["CONFIRMED", "CONSUMED"]) {
     const { fetcher, calls } = opsFetcher({ item: daily({ claimable: false, status }) })
     assert.equal((await x.dailyCheckin(cred, fetcher)).outcome, "done")
     assert.equal(calls.length, 1)
@@ -1589,6 +1791,39 @@ test("startOAuthFlow serves a callback server and a valid login URL", async () =
   assert.equal(res.status, 400)
 
   await flow.close()
+})
+
+test("the callback port is one >= 10000, another while the one picked is taken", async () => {
+  const { EventEmitter } = await import("node:events")
+  // A stand-in server: the system gives a port below 10000, and the first
+  // random picks are someone else's.
+  const fakeServer = (taken, code = "EADDRINUSE") => {
+    const tried = []
+    const server = Object.assign(new EventEmitter(), {
+      listen(port, host, cb) {
+        tried.push(port)
+        this.port = port === 0 ? 8080 : port
+        if (port !== 0 && tried.length - 1 <= taken) {
+          queueMicrotask(() => this.emit("error", Object.assign(new Error("listen failed"), { code })))
+          return
+        }
+        queueMicrotask(cb)
+      },
+      address() { return { port: this.port } },
+      close(cb) { queueMicrotask(cb) },
+    })
+    return { server, tried }
+  }
+  const busy = fakeServer(3)
+  const port = await x.listenOnCallbackPort(busy.server)
+  assert.equal(busy.tried[0], 0)
+  assert.equal(busy.tried.length, 5)
+  assert.ok(port >= 10000)
+  assert.equal(port, busy.tried.at(-1))
+  // Anything but a taken port is no reason to try another.
+  const denied = fakeServer(1, "EACCES")
+  await assert.rejects(x.listenOnCallbackPort(denied.server), { code: "EACCES" })
+  assert.equal(denied.tried.length, 2)
 })
 
 /** Run a callback server for one test, its STS answered by `sts`. */

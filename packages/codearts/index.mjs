@@ -668,19 +668,31 @@ function startOAuthCallbackServer(ticketId, pkce, keyPair, fetcher) {
   return listenOnCallbackPort(server).then((port) => ({ port, server, result }))
 }
 
-/** Listen on 127.0.0.1, retrying with a random port >= 10000 if needed. */
+const CALLBACK_PORT_TRIES = 20
+const randomCallbackPort = () => Math.floor(Math.random() * (65_536 - MIN_CALLBACK_PORT)) + MIN_CALLBACK_PORT
+
+/**
+ * Listen on 127.0.0.1: the port the system gives, or, when that is below
+ * 10000, a random one >= 10000, another while the one picked is taken.
+ */
 function listenOnCallbackPort(server) {
   return new Promise((resolve, reject) => {
+    let tries = 0
     const tryListen = (port) => {
-      server.once("error", reject)
+      const failed = (e) => {
+        if (port !== 0 && e?.code === "EADDRINUSE" && ++tries < CALLBACK_PORT_TRIES) tryListen(randomCallbackPort())
+        else reject(e)
+      }
+      server.once("error", failed)
       server.listen(port, "127.0.0.1", () => {
+        server.off("error", failed)
         const address = server.address()
         const assigned = typeof address === "object" && address ? address.port : 0
         if (assigned >= MIN_CALLBACK_PORT) {
           resolve(assigned)
           return
         }
-        server.close(() => tryListen(Math.floor(Math.random() * (65_536 - MIN_CALLBACK_PORT)) + MIN_CALLBACK_PORT))
+        server.close(() => tryListen(randomCallbackPort()))
       })
     }
     tryListen(0)
@@ -1013,6 +1025,16 @@ function signInExpiredResponse(text) {
   return new Response(body, { status: 401, headers: { "content-type": "application/json", "X-Magpie-Sign-In": "expired" } })
 }
 
+/**
+ * A stale credential that couldn't be renewed: turned away for good, a 401
+ * that marks the sign-in; or only for now (STS unreachable, a DPoP proof
+ * refused), a 503 that keeps it, for magpie to try again or fail over.
+ */
+function unrenewedResponse(context, text) {
+  if (context.signInDead?.()) return signInExpiredResponse(text)
+  return errorResponse(503, errorCodeOf(text), "临时凭据已过期，续期暂时失败，请稍后再试", { "X-Magpie-Sign-In": "kept" })
+}
+
 /** Rebuild a response whose body was read, keeping the vendor's answer. */
 function rebuildResponse(res, text, extraHeaders = {}) {
   const headers = streamHeaders(res.headers)
@@ -1119,7 +1141,13 @@ async function traceQueueCall(method, cred, traceId, context, signal) {
     if (key !== "host") headers.set(key, value)
   })
   headers.set(SESSION_HEADER, context.sessionId)
-  return context.fetcher(url, { method, headers, ...(signal ? { signal } : {}) })
+  return context.fetcher(url, { method, headers, signal })
+}
+
+/** The caller's signal, bounded to `ms` from now: a call that hangs can't outlast the wait it is part of. */
+function withinMs(signal, ms) {
+  const timeout = AbortSignal.timeout(Math.max(0, Math.min(ms, REQUEST_TIMEOUT_MS)))
+  return signal ? AbortSignal.any([signal, timeout]) : timeout
 }
 
 /**
@@ -1129,7 +1157,7 @@ async function traceQueueCall(method, cred, traceId, context, signal) {
  * Gives "promoted" or "gone"; throws the abort.
  */
 async function waitInQueue(cred, queued, context, signal, deadline) {
-  const leave = () => void traceQueueCall("DELETE", cred, queued.traceId, context).catch(() => {})
+  const leave = () => void traceQueueCall("DELETE", cred, queued.traceId, context, AbortSignal.timeout(REQUEST_TIMEOUT_MS)).catch(() => {})
   let retryAfter = queued.retryAfter
   let failures = 0
   try {
@@ -1141,12 +1169,16 @@ async function waitInQueue(cred, queued, context, signal, deadline) {
       await delay(retryAfter * 1000, signal)
       let body = null
       try {
-        const res = await traceQueueCall("GET", cred, queued.traceId, context, signal)
+        // The poll and its answer are bounded by what is left of the wait.
+        const res = await traceQueueCall("GET", cred, queued.traceId, context, withinMs(signal, deadline - Date.now()))
         body = safeJson(await res.text())
         if (!res.ok && !body?.status) throw new Error(`HTTP ${res.status}`)
       } catch (e) {
         if (signal?.aborted) throw e
-        if (++failures >= 3) return "gone"
+        if (++failures >= 3) {
+          leave()
+          return "gone"
+        }
         continue
       }
       const status = String(body?.status ?? "queued")
@@ -1195,7 +1227,10 @@ function withSignInMark(res) {
  *   a session frees or the budget runs out — then a 429, which magpie fails
  *   over on;
  * - a stale credential (401, `APIG.0602`) is renewed once and the request sent
- *   again; when that can't be done, a 401 marks the sign-in;
+ *   again; when STS turns the renewal away for good, a 401 marks the sign-in,
+ *   and when it only fails for now, a 503 keeps it;
+ * - `benefit not found` on a day not yet claimed claims it and sends again;
+ *   otherwise the model goes as the account's builtin one, if it has it;
  * - a 200 carrying only an error (a spent quota, an unknown model) becomes a
  *   429/502 with the vendor's words instead of an empty reply.
  * The permit is held until the answer's body ends: the gateway counts the
@@ -1230,6 +1265,8 @@ async function signedFetch(cred, input, init, context) {
       method, url, body, extra,
     )
     const headers = new Headers(baseHeaders)
+    // The body may have been reshaped: the transport counts it again.
+    headers.delete("content-length")
     signed.forEach((value, key) => {
       if (key !== "host") headers.set(key, value)
     })
@@ -1255,7 +1292,15 @@ async function signedFetch(cred, input, init, context) {
 
   // A sign-in known to be beyond renewal never reaches the network again.
   if (context.signInDead?.()) return signInExpiredResponse()
-  if (!chat) return withSignInMark(await send())
+  if (!chat) {
+    const res = await send()
+    if (res.status !== 401 || !context.renewCredential) return withSignInMark(res)
+    const text = await res.text().catch(() => "")
+    const next = await context.renewCredential(active)
+    if (!next) return unrenewedResponse(context, text)
+    active = next
+    return withSignInMark(await send())
+  }
 
   const release = await context.gate.acquire(signal)
   let handedOver = false
@@ -1263,6 +1308,7 @@ async function signedFetch(cred, input, init, context) {
     const clock = context.now ?? Date.now
     const started = clock()
     let renewed = false
+    let claimTried = false
     let queueDeadline = 0
     for (let attempt = 0; ; attempt += 1) {
       const res = await send()
@@ -1299,6 +1345,7 @@ async function signedFetch(cred, input, init, context) {
             active = next
             continue
           }
+          return unrenewedResponse(context, text)
         }
         return signInExpiredResponse(text)
       }
@@ -1311,12 +1358,21 @@ async function signedFetch(cred, input, init, context) {
         body = utf8(JSON.stringify(chat.body))
         continue
       }
-      // No free benefit for this model on this account (`4004`), or the header
-      // isn't taken for it (`4005`): it is the account's plain builtin model.
-      if (extra && /InferHub\.400[45]\.200|benefit not found/i.test(code || text) && isRegularModel(model, context.state)) {
-        context.state?.noBenefit.add(model)
-        extra = undefined
-        continue
+      if (extra && /InferHub\.400[45]\.200|benefit not found/i.test(code || text)) {
+        // A new Beijing day whose benefit isn't claimed yet: claim it, as the
+        // agent does each day, and send it again as the free model.
+        if (!claimTried && context.state && context.state.claim?.day !== beijingDay()) {
+          claimTried = true
+          if (await ensureBenefitClaimed(active, context.fetcher, context.state)) continue
+        }
+        // No free benefit for this model on this account (`4004`), or the
+        // header isn't taken for it (`4005`): it is the account's plain
+        // builtin model, till the next day's claim.
+        if (isRegularModel(model, context.state)) {
+          context.state?.noBenefit.add(model)
+          extra = undefined
+          continue
+        }
       }
       if (code === SESSION_LIMIT_ERROR || text.includes(SESSION_LIMIT_ERROR)) {
         const wait = retryDelayMs(attempt, context.retryDelays)
@@ -1368,7 +1424,9 @@ function describeHttpFailure(status, text) {
 /**
  * A signed snap-access call the way the IDE's ActivityWelfarePane makes it:
  * `{ code, message, data }` back, `code !== 0` being a refusal.
- * Gives `{ ok: true, data }` or `{ ok: false, message }`, never throws.
+ * Gives `{ ok: true, data }` or `{ ok: false, message }` (`refused: true` when
+ * the vendor answered with a refusal, not a network or HTTP failure), never
+ * throws.
  */
 async function snapRequest(method, url, cred, fetcher, payload) {
   const body = payload === undefined ? new Uint8Array() : utf8(JSON.stringify(payload))
@@ -1398,7 +1456,7 @@ async function snapRequest(method, url, cred, fetcher, payload) {
   const raw = safeJson(text)
   if (!raw || Array.isArray(raw)) return { ok: false, message: "the answer could not be read" }
   if (raw.code !== undefined && Number(raw.code) !== 0) {
-    return { ok: false, message: firstOf(raw.message, raw.msg, `code ${raw.code}`) }
+    return { ok: false, refused: true, message: firstOf(raw.message, raw.msg, `code ${raw.code}`) }
   }
   return { ok: true, data: "data" in raw ? raw.data : raw }
 }
@@ -1551,11 +1609,19 @@ async function dailyCheckin(cred, fetcher) {
   const item = first.item
   if (!item) return { outcome: "inactive", message: "当前没有每日领取活动" }
   const credit = num(item.benefitAmount)
+  // Claimed but never confirmed (a confirm that failed): confirm it now, or
+  // the credits stay pending. A refusal means there is nothing to confirm;
+  // a failure is tried again later that day.
+  const campaign = item.campaignId !== undefined && item.campaignId !== null && item.campaignId !== ""
+  if (!item.claimable && item.status === "CLAIMED" && campaign) {
+    const confirmed = await snapRequest("POST", OPS_CONFIRM_URL, cred, fetcher, { campaignId: item.campaignId })
+    if (confirmed.ok) return claimedOutcome({}, credit)
+    if (confirmed.refused) return { outcome: "done", message: "今天已领取" }
+    return { outcome: "failed", message: `领取确认失败：${confirmed.message}` }
+  }
   if (isClaimedToday(item)) return { outcome: "done", message: "今天已领取" }
   if (!item.claimable) return { outcome: "ineligible", message: `当前不可领取（status=${item.status ?? "null"}）` }
-  if (item.campaignId === undefined || item.campaignId === null || item.campaignId === "") {
-    return { outcome: "failed", message: "活动缺少 campaignId" }
-  }
+  if (!campaign) return { outcome: "failed", message: "活动缺少 campaignId" }
 
   const claimed = await snapRequest("POST", OPS_CLAIM_URL, cred, fetcher, { campaignId: item.campaignId, channel: OPS_CHANNEL })
   if (!claimed.ok) {
@@ -1569,6 +1635,11 @@ async function dailyCheckin(cred, fetcher) {
     const confirmed = await snapRequest("POST", OPS_CONFIRM_URL, cred, fetcher, { campaignId: item.campaignId })
     if (!confirmed.ok) return { outcome: "failed", message: `领取确认失败：${confirmed.message}` }
   }
+  return claimedOutcome(benefit, credit)
+}
+
+/** The outcome of a check-in that went through, with the grant the ledger keeps. */
+function claimedOutcome(benefit, credit) {
   const got = num(benefit.benefitAmount) || credit
   const at = Date.now()
   const grant = { at: new Date(at).toISOString(), credit: got, expiresAt: new Date(grantExpiry(benefit, at)).toISOString() }
@@ -1642,7 +1713,8 @@ const CLAIM_RETRY_MS = 60 * 60 * 1000
 /**
  * Is today's free benefit the account's? Claimed once a Beijing day (one claim
  * at a time); a refusal is asked again an hour later, and a vendor that can't
- * be reached leaves the last answer standing.
+ * be reached leaves the last answer standing. A claim that goes through starts
+ * the day afresh: the models the last one had no benefit for are asked again.
  */
 function ensureBenefitClaimed(cred, fetcher, state) {
   const day = beijingDay()
@@ -1652,6 +1724,7 @@ function ensureBenefitClaimed(cred, fetcher, state) {
     .then((r) => {
       if (r.network) return was?.ok ?? false
       state.claim = { day, ok: r.ok, at: Date.now(), code: r.code, message: r.message }
+      if (r.ok) state.noBenefit?.clear()
       return r.ok
     })
     .finally(() => { state.claiming = null })
@@ -1956,18 +2029,43 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   // nothing else: the gate; its free models today (null until its
   // gateway/config was read; the fallback stands until then), its builtin
   // ones, and the ones the gateway said it has no benefit for; today's
-  // benefit claim; its main agent's id; its credit batches.
+  // benefit claim; its main agent's id; its credit batches; the renewal of its
+  // credential under way, and the last one made.
   const accounts = new Map()
   const accountState = (key) => {
     if (!accounts.has(key)) {
       accounts.set(key, {
         gate: createConcurrencyGate(maxInflight), benefit: null, regular: null, noBenefit: new Set(),
         claim: null, claiming: null, agentId: "", batches: undefined, batchesAt: 0,
+        renewing: null, renewed: null,
       })
     }
     return accounts.get(key)
   }
   const stateOf = async (cred) => accountState((await accountSessionIds(cred)).sessionId)
+
+  // One renewal per refresh token, whoever asks for it (each of the account's
+  // loaders, magpie's auth.refresh): STS spends a refresh token once, so a
+  // second use of it would turn the account away. Whoever comes later with
+  // the same token gets what that renewal gave.
+  const renewOnce = async (cred) => {
+    const token = firstOf(cred.refresh_token)
+    if (!token) return refreshCredential(cred, fetcher)
+    const state = await stateOf(cred)
+    if (state.renewed?.from === token) return state.renewed.next
+    if (state.renewing?.from !== token) {
+      const promise = refreshCredential(cred, fetcher)
+        .then((next) => {
+          state.renewed = { from: token, next }
+          return next
+        })
+        .finally(() => {
+          if (state.renewing?.promise === promise) state.renewing = null
+        })
+      state.renewing = { from: token, promise }
+    }
+    return state.renewing.promise
+  }
   // The ledger's key: the signer, which outlives a sign-in; else the session.
   const ledgerKey = async (cred) => accountIdentityOf(cred).id || (await accountSessionIds(cred)).sessionId
 
@@ -2040,7 +2138,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       async refresh(auth) {
         const cred = credentialOf(auth)
         if (!cred) return undefined
-        const next = await refreshCredential(cred, fetcher)
+        const next = await renewOnce(cred)
         const accountId = auth.accountId ? "" : accountIdentityOf(next).id
         return {
           access: JSON.stringify(next),
@@ -2058,32 +2156,41 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
 
         // magpie renews ahead of expiry by itself; this covers hosts that
         // ignore `auth.refresh` (OpenCode) and a credential that went stale
-        // anyway (a 401 / APIG.0602). One renewal at a time; null when it fails.
+        // anyway (a 401 / APIG.0602). One renewal at a time, shared with the
+        // account's other loaders and auth.refresh; null when it fails.
         let refreshing = null
         let signInDead = false
+        // Another renewal may have landed already (magpie's own, or another
+        // process's): the stored one, when it is newer than `than`.
+        const takeStored = async (than) => {
+          const latest = await getAuth().catch(() => null)
+          const stored = credentialOf(latest)
+          if (!stored || !than(stored)) return { latest, stored: null }
+          cred = stored
+          account = latest
+          return { latest, stored }
+        }
         const renewCredential = (stale) => {
           if (signInDead) return Promise.resolve(null)
           refreshing ??= (async () => {
-            // Another renewal may have landed already (magpie's own, or another
-            // process): take that over rather than spend the refresh token twice.
-            const latest = await getAuth().catch(() => null)
-            const stored = credentialOf(latest)
-            if (stored && stored.access_key_id !== stale.access_key_id && !nearExpiry(stored)) {
-              cred = stored
-              account = latest
-              return stored
-            }
-            const base = stored ?? cred
-            if (!base.refresh_token) return null
-            const next = await refreshCredential(base, fetcher)
-            cred = next
-            account = await persistCredential(client, latest ?? account, next)
-            return next
-          })()
-            .catch((e) => {
-              if (isPermanentRefreshFailure(e)) signInDead = true
+            const first = await takeStored((s) => s.access_key_id !== stale.access_key_id && !nearExpiry(s))
+            if (first.stored) return first.stored
+            const base = credentialOf(first.latest) ?? cred
+            try {
+              const next = await renewOnce(base)
+              cred = next
+              account = await persistCredential(client, first.latest ?? account, next)
+              return next
+            } catch (e) {
+              if (!isPermanentRefreshFailure(e)) return null
+              // The token was spent a moment ago by someone else: theirs stands.
+              const after = await takeStored((s) => !!s.refresh_token && s.refresh_token !== base.refresh_token)
+              if (after.stored) return after.stored
+              signInDead = true
               return null
-            })
+            }
+          })()
+            .catch(() => null)
             .finally(() => { refreshing = null })
           return refreshing
         }
