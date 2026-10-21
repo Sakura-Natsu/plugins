@@ -53,7 +53,7 @@ signing in, a short built-in catalog stands in.
 - Every request is signed with Huawei's SDK-HMAC-SHA256 using the temporary credentials, and
   only for CodeArts' own two hosts, `snap-access.cn-north-4.myhuaweicloud.com` and
   `opengw.developer.huaweicloud.com`: a request anywhere else (an overridden `api`) is refused
-  before the credentials leave.
+  before the credentials leave, and no signed or token request follows a redirect.
 - The gateway allows 3 concurrent sessions per account and tells them apart by
   `x-ot-session-id`; the plugin sends one stable session id per account (and a fresh trace per
   request) like the client, keeps at most 3 chats in flight per account, retries
@@ -78,8 +78,9 @@ signing in, a short built-in catalog stands in.
   `~/.config/magpie/codearts-checkins.json` (or `MAGPIE_CODEARTS_LEDGER`). This part is still
   being checked against more accounts — trust the CodeArts console where they differ.
 - `auth.checkin`: the client's 「限时福利 → 每日领取」 — `GET /v1/ops/delivery?channel=IDE`,
-  `POST /v1/ops/claim`, then `POST /v1/ops/confirm` when the claim answers an id (a claim left
-  unconfirmed is confirmed at the next check-in). Turn on
+  `POST /v1/ops/claim`, then `POST /v1/ops/confirm` when the claim answers an id. A claim whose
+  confirm failed is kept in that ledger for the day and confirmed at the next check-in; one the
+  client leaves unconfirmed (`id: null`) never is. Turn on
   *Auto check-in* for CodeArts under **Settings → Usage → Plugins**.
 
 ## Options
@@ -117,14 +118,15 @@ magpie 里使用其 GLM、DeepSeek、openPangu 等模型。provider id：`codear
 - **模型**：账号实时的内置模型列表；领取当日免费权益成功后，再加上免费模型（每个北京自然日领一次，与
   客户端一致；当天还没领取时遇到 `benefit not found` 也会先领取再重发）。每个模型的「消耗系数」作为 magpie 的倍率上报，来自账号主智能体（`build`）的模型列表。
 - **请求**：SDK-HMAC-SHA256 签名，只签给码道自己的两个主机（`snap-access.cn-north-4.myhuaweicloud.com`、
-  `opengw.developer.huaweicloud.com`），发往其他地址（如改过的 `api`）的请求在凭据发出前就被拒绝；像客户端一样发送 `x-ot-session-id` 会话头（每账号一个会话），账号内
+  `opengw.developer.huaweicloud.com`），发往其他地址（如改过的 `api`）的请求在凭据发出前就被拒绝，签名请求和令牌请求都不跟随重定向；像客户端一样发送 `x-ot-session-id` 会话头（每账号一个会话），账号内
   在途请求不超过 3 个，`TM.00001041` 退避重试，网关排队时按客户端的方式等待；总是以流式请求上游（码道
   只对流式回答计量积分），调用方要非流式时折叠回 JSON；默认注入 `thinking: { type: "enabled" }`，思考与
   正文分开；200 里内嵌的错误换算为 `429` / `400` / `502` 并带厂商原话。
 - **用量与签到**：总积分决定账号是否可用，其余积分桶只做明细；另有每日免费额度窗口。各批积分的到期
   时间读自码道控制台同一批接口，读不到时退回插件的签到账本 `~/.config/magpie/codearts-checkins.json`
   （这部分仍在用更多账号验证，请以控制台为准）。`auth.checkin` 与客户端「限时福利 → 每日领取」一致
-  （领取后未确认的，下次签到时补确认），在 **设置 → 用量 → Plugins** 打开「每日自动签到」即可。
+  （插件领取后确认失败的，当天记在签到账本里，下次签到时补确认；客户端本就不确认的 `id: null` 领取不会被确认），
+  在 **设置 → 用量 → Plugins** 打开「每日自动签到」即可。
 - **致谢**：原作者 [yuweihao17](https://github.com/yuweihao17/codearts)；HuHong-Tao、ReachForStar 的
   实测与实现；[Ebony-Vinyl/dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)。
 
