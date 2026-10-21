@@ -25,7 +25,9 @@ or install it from magpie's Plugins tab and sign in there.
 **Sign in with Huawei Cloud** opens Huawei Cloud's consent page. The plugin listens on a
 loopback port (`127.0.0.1`, ≥ 10000) for the redirect and exchanges the code at Huawei Cloud
 STS — a PKCE flow whose token requests carry an ES256 DPoP proof, as the CodeArts client does.
-STS answers with temporary AK/SK/security-token credentials and a refresh token.
+STS answers with temporary AK/SK/security-token credentials and a refresh token. The callback
+server takes one GET to `/oauth/callback`, exactly; one that comes back without a code (the
+portal's error) fails the sign-in at once.
 
 **Where it is kept:** the whole credential (AK/SK/security token, expiry, refresh token, the
 PKCE verifier and the DPoP private key) is a JSON string in the account's `access` field, in
@@ -48,7 +50,10 @@ signing in, a short built-in catalog stands in.
 
 ## Requests
 
-- Every request is signed with Huawei's SDK-HMAC-SHA256 using the temporary credentials.
+- Every request is signed with Huawei's SDK-HMAC-SHA256 using the temporary credentials, and
+  only for CodeArts' own two hosts, `snap-access.cn-north-4.myhuaweicloud.com` and
+  `opengw.developer.huaweicloud.com`: a request anywhere else (an overridden `api`) is refused
+  before the credentials leave.
 - The gateway allows 3 concurrent sessions per account and tells them apart by
   `x-ot-session-id`; the plugin sends one stable session id per account (and a fresh trace per
   request) like the client, keeps at most 3 chats in flight per account, retries
@@ -105,13 +110,14 @@ magpie 里使用其 GLM、DeepSeek、openPangu 等模型。provider id：`codear
 > 这可能不符合华为云的服务条款，接口也可能随时变更。使用风险（包括账号受限）由使用者自行承担。
 
 - **登录**：华为云 OAuth（PKCE + DPoP），本机 `127.0.0.1`（端口 ≥ 10000）接收回调，向 STS 换取临时
-  AK/SK/security-token。完整凭据（含 refresh_token、PKCE verifier、DPoP 私钥）以 JSON 存在账号的
+  AK/SK/security-token；回调只接受精确的 `/oauth/callback` GET，回调不带 code（portal 报错）时立即判定登录失败。完整凭据（含 refresh_token、PKCE verifier、DPoP 私钥）以 JSON 存在账号的
   `access` 字段里，保存在 magpie / OpenCode 自己的账号存储中；过期前 30 分钟自动续期，请求遇到临时凭据
   过期时就地续期并重发一次。同一账号的 refresh_token 只用一次；续期只是暂时失败（如 STS 连不上）时返回
   `503` 并保留登录，只有被 STS 明确拒绝才标记需要重新登录。账号标识取自 refresh_token，重复登录不会多出账号。
 - **模型**：账号实时的内置模型列表；领取当日免费权益成功后，再加上免费模型（每个北京自然日领一次，与
   客户端一致；当天还没领取时遇到 `benefit not found` 也会先领取再重发）。每个模型的「消耗系数」作为 magpie 的倍率上报，来自账号主智能体（`build`）的模型列表。
-- **请求**：SDK-HMAC-SHA256 签名；像客户端一样发送 `x-ot-session-id` 会话头（每账号一个会话），账号内
+- **请求**：SDK-HMAC-SHA256 签名，只签给码道自己的两个主机（`snap-access.cn-north-4.myhuaweicloud.com`、
+  `opengw.developer.huaweicloud.com`），发往其他地址（如改过的 `api`）的请求在凭据发出前就被拒绝；像客户端一样发送 `x-ot-session-id` 会话头（每账号一个会话），账号内
   在途请求不超过 3 个，`TM.00001041` 退避重试，网关排队时按客户端的方式等待；总是以流式请求上游（码道
   只对流式回答计量积分），调用方要非流式时折叠回 JSON；默认注入 `thinking: { type: "enabled" }`，思考与
   正文分开；200 里内嵌的错误换算为 `429` / `400` / `502` 并带厂商原话。

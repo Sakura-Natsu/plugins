@@ -59,17 +59,20 @@ const CHAT_API_BASE = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2"
 const SNAP_HOST = "https://snap-access.cn-north-4.myhuaweicloud.com"
 const SNAP_MODEL_BUILTIN_URL = `${SNAP_HOST}/v1/model/builtin`
 const SNAP_STATISTICS_URL = `${SNAP_HOST}/snap-manager/v1/statistics/plugin`
-// The only hosts the account's credentials are signed for and sent to.
-const HUAWEI_HOST = /(^|\.)(myhuaweicloud\.com|myhuaweicloud\.cn|huaweicloud\.com)$/i
 // opengw gateway config: the benefit/free-quota model set.
-const OPENGW_GATEWAY_CONFIG_URL = "https://opengw.developer.huaweicloud.com/api/v1/gateway/config"
+const OPENGW_HOST = "https://opengw.developer.huaweicloud.com"
+const OPENGW_GATEWAY_CONFIG_URL = `${OPENGW_HOST}/api/v1/gateway/config`
+// The only hosts the account's credentials are signed for and sent to: the
+// two the plugin itself calls, by name. STS takes the refresh token, never a
+// signature, and the portal only ever opens in the browser.
+const SIGNED_HOSTS = new Set([SNAP_HOST, OPENGW_HOST].map((u) => new URL(u).host))
 // The daily free token pool a `maas_type: benefit` chat draws on (never the
 // credit packages), so a free model's spend shows up in the usage panel.
-const BENEFIT_BALANCE_URL = "https://opengw.developer.huaweicloud.com/api/v1/user/tokens/balance"
+const BENEFIT_BALANCE_URL = `${OPENGW_HOST}/api/v1/user/tokens/balance`
 // The free models are the account's only once today's benefit is claimed: the
 // CodeArts agent POSTs this before it lists them (`claimBenefit`), and leaves
 // them out when it fails (4004 no benefit / expired, 4006 today's places gone).
-const BENEFIT_CLAIM_URL = "https://opengw.developer.huaweicloud.com/api/v1/benefit/claim"
+const BENEFIT_CLAIM_URL = `${OPENGW_HOST}/api/v1/benefit/claim`
 const BENEFIT_OK = "0000"
 // The agent's own model list, with each model's credit rate (`credit[].
 // ratio_display`, shown as "1.50x") and its parameters: the CodeAgent's detail.
@@ -616,23 +619,26 @@ const buildPortalLoginResultUrl = (ok) =>
 
 /**
  * Start the loopback callback server, listening on 127.0.0.1:port>=10000. It
- * takes one thing: a GET to the callback path with the authorization code,
- * which it exchanges at STS (PKCE + DPoP), then sends the browser on to the
- * portal's own result page. The redirect target is always that page, never a
- * parameter of the request.
+ * takes one thing: a GET to the callback path, exactly as sent, with the
+ * authorization code, which it exchanges at STS (PKCE + DPoP), then sends the
+ * browser on to the portal's own result page. A callback without a code ends
+ * the sign-in at once, with the portal's own words when it gave any. The
+ * redirect target is always that page, never a parameter of the request.
  */
-function startOAuthCallbackServer(ticketId, pkce, keyPair, fetcher) {
+function startOAuthCallbackServer(pkce, keyPair, fetcher) {
   let resolveResult
   let rejectResult
   const result = new Promise((resolve, reject) => {
     resolveResult = resolve
     rejectResult = reject
   })
-  let exchanging = false
+  let answered = false
 
   const server = createServer((request, response) => {
-    const url = new URL(request.url ?? "/", `http://127.0.0.1:${request.socket.localPort}`)
-    if (url.pathname !== REDIRECT_PATH) {
+    // The path as sent, not as a URL would normalise it (`/oauth/./callback`).
+    const raw = request.url ?? "/"
+    const query = raw.indexOf("?")
+    if ((query < 0 ? raw : raw.slice(0, query)) !== REDIRECT_PATH) {
       response.writeHead(404).end("Not found")
       return
     }
@@ -640,17 +646,20 @@ function startOAuthCallbackServer(ticketId, pkce, keyPair, fetcher) {
       response.writeHead(405, { Allow: "GET" }).end("Method not allowed")
       return
     }
-    const code = url.searchParams.get("code")
-    if (!code) {
-      response.writeHead(400).end("Missing authorization code")
-      return
-    }
-    // One sign-in, one code: a second callback for the same flow is refused.
-    if (exchanging) {
+    // One sign-in, one callback: another one for the same flow is refused.
+    if (answered) {
       response.writeHead(409).end("This sign-in is already being completed")
       return
     }
-    exchanging = true
+    answered = true
+    const url = new URL(raw, `http://127.0.0.1:${request.socket.localPort}`)
+    const code = url.searchParams.get("code")
+    if (!code) {
+      response.writeHead(307, { Location: buildPortalLoginResultUrl(false) }).end()
+      const said = firstOf(url.searchParams.get("error_description"), url.searchParams.get("error"))
+      rejectResult(new Error(`CodeArts sign-in failed: ${said || "the callback came back without an authorization code"}`))
+      return
+    }
     const port = request.socket.localPort ?? 0
     void exchangeAuthorizationCode(code, pkce.codeVerifier, port, keyPair, fetcher).then(
       (token) => {
@@ -705,11 +714,12 @@ function listenOnCallbackPort(server) {
  * the callback server is closed as soon as the result settles.
  */
 async function startOAuthFlow(fetcher) {
-  const ticketId = randomHex(32)
   const pkce = await generatePkcePair()
   const keyPair = await generateDpopKeyPair()
-  const { port, server, result } = await startOAuthCallbackServer(ticketId, pkce, keyPair, fetcher)
-  const loginUrl = buildOAuthLoginUrl(port, pkce, ticketId)
+  const { port, server, result } = await startOAuthCallbackServer(pkce, keyPair, fetcher)
+  // The authorize URL carries a ticket_id as the IDE's does; the code flow
+  // itself never reads it back.
+  const loginUrl = buildOAuthLoginUrl(port, pkce, randomHex(32))
 
   let closed = false
   const close = async () => {
@@ -1204,11 +1214,11 @@ function hostOf(url) {
   }
 }
 
-/** Is this an https URL on one of Huawei Cloud's hosts, the only ones the credentials go to? */
-function isHuaweiUrl(url) {
+/** Is this an https URL on one of SIGNED_HOSTS (its default port), the only ones the credentials go to? */
+function isSignedHostUrl(url) {
   try {
     const u = new URL(url)
-    return u.protocol === "https:" && HUAWEI_HOST.test(u.hostname)
+    return u.protocol === "https:" && SIGNED_HOSTS.has(u.host)
   } catch {
     return false
   }
@@ -1237,15 +1247,15 @@ function withSignInMark(res) {
  * - a 200 carrying only an error (a spent quota, an unknown model) becomes a
  *   429/502 with the vendor's words instead of an empty reply.
  * The permit is held until the answer's body ends: the gateway counts the
- * session while it streams. Only Huawei Cloud hosts are signed for: a request
+ * session while it streams. Only SIGNED_HOSTS are signed for: a request
  * anywhere else (an overridden `api`, say) is refused before the access key or
  * security token leave.
  */
 async function signedFetch(cred, input, init, context) {
   const req = typeof Request !== "undefined" && input instanceof Request ? input : null
   const url = req ? req.url : String(input)
-  if (!isHuaweiUrl(url)) {
-    return errorResponse(400, "", `refusing to sign a request to ${hostOf(url) || "an unknown host"}: only Huawei Cloud hosts get the account's credentials`)
+  if (!isSignedHostUrl(url)) {
+    return errorResponse(400, "", `refusing to sign a request to ${hostOf(url) || "an unknown host"}: only CodeArts' own hosts (${[...SIGNED_HOSTS].join(", ")}) get the account's credentials`)
   }
   const method = String(init?.method ?? req?.method ?? "GET").toUpperCase()
   const baseHeaders = new Headers(init?.headers ?? req?.headers)
@@ -2359,7 +2369,7 @@ export const _internal = {
   requestToken, exchangeAuthorizationCode, exchangeRefreshToken, refreshCredential,
   isDeadRefreshToken, isPermanentRefreshFailure, nearExpiry, persistCredential,
   buildOAuthLoginUrl, buildPortalLoginResultUrl,
-  startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow, isHuaweiUrl, hostOf,
+  startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow, isSignedHostUrl, hostOf, SIGNED_HOSTS,
   BENEFIT_CLAIM_URL, AGENT_LIST_URL, AGENT_DETAIL_URL, CODE_AGENT_ID,
   canonicalQuery, beijingDay, nextBeijingMidnight, vendorDate, creditRateOf,
   claimBenefit, ensureBenefitClaimed, parseAgentModel, fetchAgentModels,

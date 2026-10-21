@@ -7,6 +7,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs"
+import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 
@@ -1149,15 +1150,20 @@ test("a 403 is a sign-in the account no longer has, on chats and other requests 
   assert.equal(calls, 2, "a 403 is not retried")
 })
 
-test("isHuaweiUrl takes only https URLs on Huawei Cloud's own hosts", () => {
-  assert.equal(x.isHuaweiUrl(CHAT_URL), true)
-  assert.equal(x.isHuaweiUrl("https://codearts.huaweicloud.com/x"), true)
-  assert.equal(x.isHuaweiUrl("https://iam.myhuaweicloud.cn/v3"), true)
-  assert.equal(x.isHuaweiUrl("http://snap-access.cn-north-4.myhuaweicloud.com/api"), false, "not over plain http")
-  assert.equal(x.isHuaweiUrl("https://myhuaweicloud.com.example.com/"), false)
-  assert.equal(x.isHuaweiUrl("https://evilmyhuaweicloud.com/"), false)
-  assert.equal(x.isHuaweiUrl("https://example.com/?u=myhuaweicloud.com"), false)
-  assert.equal(x.isHuaweiUrl("not a url"), false)
+test("isSignedHostUrl takes only https URLs on the two hosts the plugin calls, by name", () => {
+  assert.deepEqual([...x.SIGNED_HOSTS].sort(), ["opengw.developer.huaweicloud.com", "snap-access.cn-north-4.myhuaweicloud.com"])
+  assert.equal(x.isSignedHostUrl(CHAT_URL), true)
+  assert.equal(x.isSignedHostUrl(x.BENEFIT_CLAIM_URL), true)
+  assert.equal(x.isSignedHostUrl("https://SNAP-ACCESS.cn-north-4.myhuaweicloud.com/api/v2/chat/completions"), true, "a hostname has no case")
+  // Other Huawei Cloud hosts don't get the account's signature either.
+  for (const other of ["https://codearts.huaweicloud.com/x", "https://iam.myhuaweicloud.cn/v3", "https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens", "https://snap-access.cn-south-1.myhuaweicloud.com/api"]) {
+    assert.equal(x.isSignedHostUrl(other), false, other)
+  }
+  assert.equal(x.isSignedHostUrl("http://snap-access.cn-north-4.myhuaweicloud.com/api"), false, "not over plain http")
+  assert.equal(x.isSignedHostUrl("https://snap-access.cn-north-4.myhuaweicloud.com:8443/api"), false, "not on another port")
+  assert.equal(x.isSignedHostUrl("https://snap-access.cn-north-4.myhuaweicloud.com.example.com/"), false)
+  assert.equal(x.isSignedHostUrl("https://example.com/?u=snap-access.cn-north-4.myhuaweicloud.com"), false)
+  assert.equal(x.isSignedHostUrl("not a url"), false)
 })
 
 test("a request to any other host is refused before the credentials leave", async () => {
@@ -1822,9 +1828,11 @@ test("startOAuthFlow serves a callback server and a valid login URL", async () =
   const port = Number(url.searchParams.get("port"))
   assert.ok(port >= 10000, "callback port must be >= 10000")
 
-  // A callback without a code is rejected.
-  const res = await fetch(`http://127.0.0.1:${port}/oauth/callback`)
-  assert.equal(res.status, 400)
+  // A callback without a code fails the flow at once (the browser is sent to
+  // the portal's failure page, not followed there).
+  const res = await fetch(`http://127.0.0.1:${port}/oauth/callback`, { redirect: "manual" })
+  assert.equal(res.status, 307)
+  await assert.rejects(flow.result, /without an authorization code/)
 
   await flow.close()
 })
@@ -1871,7 +1879,7 @@ async function withCallbackServer(sts, run) {
     exchanges.push(new URLSearchParams(init.body))
     return sts()
   }
-  const { port, server, result } = await x.startOAuthCallbackServer("ticket", pkce, keyPair, fetcher)
+  const { port, server, result } = await x.startOAuthCallbackServer(pkce, keyPair, fetcher)
   result.catch(() => {})
   const call = (query = "", init = {}) =>
     fetch(`http://127.0.0.1:${port}${x.REDIRECT_PATH}${query}`, { redirect: "manual", ...init })
@@ -1883,18 +1891,58 @@ async function withCallbackServer(sts, run) {
   }
 }
 
-test("the callback server takes only a GET with a code, and never a redirect it is handed", async () => {
-  await withCallbackServer(() => new Response(stsBody("AK", "R"), { status: 200 }), async ({ port, call, exchanges }) => {
+/**
+ * A GET with its path sent as written, over a bare socket: fetch, and bun's
+ * http.request, normalise `/oauth/./callback` before it leaves. Gives the
+ * status and the Location.
+ */
+const rawGet = (port, rawPath) => new Promise((resolve, reject) => {
+  const socket = net.connect(port, "127.0.0.1", () => {
+    socket.write(`GET ${rawPath} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`)
+  })
+  let answer = ""
+  socket.on("data", (d) => { answer += d })
+  socket.on("end", () => resolve({
+    status: Number(/^HTTP\/1\.1 (\d{3})/.exec(answer)?.[1]),
+    location: /^location: *(.*?)\r?$/im.exec(answer.split("\r\n\r\n")[0])?.[1] ?? null,
+  }))
+  socket.on("error", reject)
+})
+
+test("the callback server takes only a GET to the exact path with a code, and never a redirect it is handed", async () => {
+  await withCallbackServer(() => new Response(stsBody("AK", "R"), { status: 200 }), async ({ port, call, result, exchanges }) => {
     const post = await call("?code=C", { method: "POST" })
     assert.equal(post.status, 405)
     assert.equal(post.headers.get("allow"), "GET")
-    // The old login's parameters are no way in: no code, no exchange, no redirect.
-    const legacy = await call(`?secret=${encodeURIComponent('{"access":"AK"}')}&redirect=${encodeURIComponent("https://evil.example/")}`)
-    assert.equal(legacy.status, 400)
-    assert.equal(legacy.headers.get("location"), null)
-    const elsewhere = await fetch(`http://127.0.0.1:${port}/other?code=C`, { redirect: "manual" })
-    assert.equal(elsewhere.status, 404)
+    // Only the path exactly as sent: none of these is it.
+    const near = ["/other", "/oauth/./callback", "/oauth/%2e/callback", "/oauth/callback/", "/OAUTH/callback", "//oauth/callback"]
+    for (const path of near.map((p) => `${p}?code=C`)) {
+      assert.equal((await rawGet(port, path)).status, 404, path)
+    }
     assert.equal(exchanges.length, 0)
+    // The old login's parameters are no way in: no code is a sign-in that
+    // failed, at once, and the browser goes to the portal's page, not theirs.
+    // (Sent the raw way too, so the 404s above aren't the socket's doing.)
+    const legacyRaw = await rawGet(port, `${x.REDIRECT_PATH}?secret=S&redirect=https%3A%2F%2Fevil.example%2F`)
+    assert.deepEqual(legacyRaw, { status: 307, location: x.buildPortalLoginResultUrl(false) })
+    await assert.rejects(result, /without an authorization code/)
+    // Nothing after that is taken, nor exchanged.
+    const legacy = await call(`?secret=${encodeURIComponent('{"access":"AK"}')}&redirect=${encodeURIComponent("https://evil.example/")}`)
+    assert.equal(legacy.status, 409)
+    assert.equal(legacy.headers.get("location"), null)
+    assert.equal((await call("?code=C")).status, 409)
+    assert.equal(exchanges.length, 0)
+  })
+})
+
+test("a callback the portal sends back with an error ends the sign-in at once, in its words", async () => {
+  await withCallbackServer(() => new Response(stsBody("AK", "R"), { status: 200 }), async ({ call, result }) => {
+    const started = Date.now()
+    const res = await call("?error=access_denied&error_description=user%20cancelled%20the%20sign-in")
+    assert.equal(res.status, 307)
+    assert.equal(res.headers.get("location"), x.buildPortalLoginResultUrl(false))
+    await assert.rejects(result, /CodeArts sign-in failed: user cancelled the sign-in/)
+    assert.ok(Date.now() - started < 5_000, "not left to the 180 s timeout")
   })
 })
 
