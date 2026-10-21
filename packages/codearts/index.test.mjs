@@ -1881,6 +1881,30 @@ test("checkin confirms the claim it left unconfirmed, and tries again later when
   assert.equal((await x.dailyCheckin(cred, meanwhile.fetcher, { unconfirmed })).outcome, "done")
 })
 
+test("a failed confirm is still made by the next check-in when the ledger can't be written", async () => {
+  const cred = await makeCred()
+  // A ledger under a file, not a folder: every write to it fails.
+  const blocker = path.join(ledgerDir, "not-a-folder")
+  fs.writeFileSync(blocker, "")
+  const ledgerPath = path.join(blocker, "ledger.json")
+  let confirms = 0
+  const ops = opsFetcher({ item: daily() }, {
+    confirm: (st) => {
+      confirms += 1
+      if (confirms === 1) return new Response("", { status: 502 })
+      st.item = { ...st.item, status: "CONFIRMED" }
+      return new Response(JSON.stringify({ code: 0, data: null }), { status: 200 })
+    },
+  })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: ops.fetcher, ledgerPath })
+  assert.equal((await plugin.auth.checkin(async () => makeAuth(cred))).outcome, "failed")
+  assert.equal(fs.existsSync(ledgerPath), false)
+  assert.equal((await plugin.auth.checkin(async () => makeAuth(cred))).outcome, "claimed")
+  assert.equal(confirms, 2)
+  assert.equal((await plugin.auth.checkin(async () => makeAuth(cred))).outcome, "done")
+  assert.equal(confirms, 2)
+})
+
 test("a claim answering no id is never confirmed, however many check-ins follow it", async () => {
   const cred = await makeCred()
   const ledgerPath = path.join(ledgerDir, "no-id.json")

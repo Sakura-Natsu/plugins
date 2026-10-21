@@ -2072,14 +2072,15 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   // gateway/config was read; the fallback stands until then), its builtin
   // ones, and the ones the gateway said it has no benefit for; today's
   // benefit claim; its main agent's id; its credit batches; the renewal of its
-  // credential under way, and the last one made.
+  // credential under way, and the last one made; today's check-in claim whose
+  // confirm failed.
   const accounts = new Map()
   const accountState = (key) => {
     if (!accounts.has(key)) {
       accounts.set(key, {
         gate: createConcurrencyGate(maxInflight), benefit: null, regular: null, noBenefit: new Set(),
         claim: null, claiming: null, agentId: "", batches: undefined, batchesAt: 0,
-        renewing: null, renewed: null,
+        renewing: null, renewed: null, unconfirmed: null,
       })
     }
     return accounts.get(key)
@@ -2307,16 +2308,27 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         const cred = credentialOf(await getAuth())
         if (!cred?.access_key_id) return { outcome: "failed", message: "not signed in" }
         const key = await ledgerKey(cred)
-        const left = readUnconfirmed(ledgerPath, key)
+        const state = await stateOf(cred)
+        const today = beijingDay()
+        // The account's own memory first: the ledger is written best effort,
+        // and a write that failed mustn't lose the claim; the ledger carries it
+        // to another process, or past a restart.
+        const held = state.unconfirmed?.day === today ? state.unconfirmed : undefined
+        const left = held ?? readUnconfirmed(ledgerPath, key)
         const { grant, unconfirmed, ...r } = await dailyCheckin(cred, fetcher, { unconfirmed: left })
         // A claim whose confirm failed is kept for the next check-in; one
         // confirmed now, or found done, is dropped.
-        if (unconfirmed) recordUnconfirmed(ledgerPath, key, unconfirmed)
-        else if (left && r.outcome !== "failed") recordUnconfirmed(ledgerPath, key, null)
+        if (unconfirmed) {
+          state.unconfirmed = { ...unconfirmed, day: today }
+          recordUnconfirmed(ledgerPath, key, unconfirmed)
+        } else if (left && r.outcome !== "failed") {
+          state.unconfirmed = null
+          recordUnconfirmed(ledgerPath, key, null)
+        }
         if (r.outcome === "claimed") {
           // The new batch shows at the next usage read; the ledger keeps it in
           // case the vendor's batch list can't be read.
-          ;(await stateOf(cred)).batchesAt = 0
+          state.batchesAt = 0
           if (grant) recordGrant(ledgerPath, key, grant)
         }
         return r
